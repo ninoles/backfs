@@ -256,19 +256,19 @@ void trim_directory(const char *path)
     
         DIR *d = opendir(dir);
         struct dirent *e;
-        bool found_mtime = false;
+        bool found_stat = false;
         while ((e = readdir(d)) != NULL) {
             if (e->d_name[0] == '.')
                 continue;
             
-            // remove mtime files, if found
-            if (strcmp(e->d_name, "mtime") == 0) {
+            // remove stat files, if found
+            if (strcmp(e->d_name, "stat") == 0) {
                 struct stat s;
-                char mtime[PATH_MAX];
-                snprintf(mtime, PATH_MAX, "%s/mtime", dir);
-                stat(mtime, &s);
+                char statpath[PATH_MAX];
+                snprintf(statpath, PATH_MAX, "%s/stat", dir);
+                stat(statpath, &s);
                 if (S_IFREG & s.st_mode) {
-                    found_mtime = true;
+                    found_stat = true;
                     continue;
                 }
             }
@@ -280,14 +280,14 @@ void trim_directory(const char *path)
             return;
         }
         
-        if (found_mtime) {
-            char mtime[PATH_MAX];
-            snprintf(mtime, PATH_MAX, "%s/mtime", dir);
-            if (unlink(mtime) == -1) {
-                PERROR("in trim_directory, unable to unlink mtime file");
-                ERROR("\tpath was %s\n", mtime);
+        if (found_stat) {
+            char statpath[PATH_MAX];
+            snprintf(statpath, PATH_MAX, "%s/stat", dir);
+            if (unlink(statpath) == -1) {
+                PERROR("in trim_directory, unable to unlink stat file");
+                ERROR("\tpath was %s\n", statpath);
             } else {
-                DEBUG("removed mtime file %s/mtime\n", dir);
+                DEBUG("removed stat file %s/stat\n", dir);
             }
         }
 
@@ -412,12 +412,12 @@ int cache_invalidate_file_real(const char *filename, bool error_if_not_exist)
     struct dirent *result = e;
     while (readdir_r(d, e, &result) == 0 && result != NULL) {
         // probably not needed, because trim_directory would take care of the
-        // mtime file, but might as well do it now to save time.
-        if (strcmp(e->d_name, "mtime") == 0) {
-            char mtime[PATH_MAX];
-            snprintf(mtime, PATH_MAX, "%s/mtime", mappath);
-            DEBUG("removed mtime file %s\n", mtime);
-            unlink(mtime);
+        // stat file, but might as well do it now to save time.
+        if (strcmp(e->d_name, "stat") == 0) {
+            char statpath[PATH_MAX];
+            snprintf(statpath, PATH_MAX, "%s/stat", mappath);
+            DEBUG("removed stat file %s\n", statpath);
+            unlink(statpath);
             continue;
         }
     
@@ -581,11 +581,72 @@ int cache_free_orphan_buckets(void)
 }
 
 /*
+ * Return the stat from the file (or dir) in the cache.
+ *
+ * Returns 0 on success.
+ * On error returns -1 and sets errno.
+ * In particular, if the block is not in the cache, sets ENOENT
+ */
+int cache_stat(const char *filename, struct stat* stbuf)
+{
+    if (filename == NULL || stbuf == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    DEBUG("stat of file %s\n", filename);
+
+    int ret = 0;
+    char mpath[PATH_MAX];
+
+    //###
+    pthread_mutex_lock(&lock);
+
+    // TODO OFFLINE: There should be a stat file for both file and dirs
+    // (and links ?).
+    snprintf(mpath, PATH_MAX, "%s/map%s", cache_dir, filename);
+    ret = lstat(mpath, stbuf);
+
+    if (!ret) {
+
+        char statpath[PATH_MAX];
+
+        snprintf(statpath, PATH_MAX, "%s/stat", mpath);
+        FILE *f = fopen(statpath, "r");
+        if (f != NULL) {
+          if (fread(stbuf, sizeof(*stbuf), 1, f) != 1) {
+                ERROR("error reading stat file");
+        
+                // debug
+                char buf[4096];
+                fseek(f, 0, SEEK_SET);
+                size_t b = fread(buf, 1, 4096, f);
+                buf[b] = '\0';
+                ERROR("stat file contains: %u bytes: %s", (unsigned int) b, buf);
+        
+                fclose(f);
+                f = NULL;
+                unlink(statpath);
+        
+                errno = EIO;
+                return -1;
+            }
+            fclose(f);
+        }
+    }
+
+    pthread_mutex_unlock(&lock);
+    //###
+
+    return 0;
+}
+
+/*
  * Read a block from the cache.
  * Important: you can specify less than one block, but not more.
  * Nor can a read be across block boundaries.
  *
- * mtime is the file modification time. If what's in the cache doesn't match
+ * stat is the file modification time. If what's in the cache doesn't match
  * this, the cache data is invalidated and this function returns -1 and sets
  * ENOENT.
  *
@@ -633,41 +694,42 @@ int cache_fetch(const char *filename, uint32_t block, uint64_t offset,
 
     bucket_to_head(bucketpath);
     
-    uint64_t bucket_mtime;
-    char mtimepath[PATH_MAX];
-    snprintf(mtimepath, PATH_MAX, "%s/map%s/mtime", cache_dir, filename);
-    FILE *f = fopen(mtimepath, "r");
+    struct stat bucket_stat;
+    char statpath[PATH_MAX];
+    snprintf(statpath, PATH_MAX, "%s/map%s/stat", cache_dir, filename);
+    FILE *f = fopen(statpath, "r");
     if (f == NULL) {
-        PERROR("open mtime file failed");
-        bucket_mtime = 0; // will cause invalidation
+        PERROR("open stat file failed");
+        bucket_stat.st_mtime = 0; // will cause invalidation
     } else {
-        if (fscanf(f, "%llu", (unsigned long long *) &bucket_mtime) != 1) {
-            ERROR("error reading mtime file");
+        if (fread(&bucket_stat, sizeof bucket_stat, 1, f) != 1) {
+            ERROR("error reading stat file");
 
             // debug
             char buf[4096];
             fseek(f, 0, SEEK_SET);
             size_t b = fread(buf, 1, 4096, f);
             buf[b] = '\0';
-            ERROR("mtime file contains: %u bytes: %s", (unsigned int) b, buf);
+            ERROR("stat file contains: %u bytes: %s", (unsigned int) b, buf);
 
             fclose(f);
             f = NULL;
-            unlink(mtimepath);
+            unlink(statpath);
 
-            bucket_mtime = 0; // will cause invalidation
+            bucket_stat.st_mtime = 0; // will cause invalidation
         }
     }
     if (f) fclose(f);
+
     
-    if (bucket_mtime != (uint64_t)mtime) {
-        // mtime mismatch; invalidate and return
-        if (bucket_mtime < (uint64_t)mtime) {
-            DEBUG("cache data is %llu seconds older than the backing data\n",
-                 (unsigned long long) mtime - bucket_mtime);
+    if (bucket_stat.st_mtime == 0 || (mtime != 0 && bucket_stat.st_mtime != mtime)) {
+        // stat mismatch; invalidate and return
+        if (bucket_stat.st_mtime < mtime) {
+            DEBUG("cache data is %llu seconds older than the data caller wants\n",
+                 (unsigned long long) mtime - bucket_stat.st_mtime);
         } else {
-            DEBUG("cache data is %llu seconds newer than the backing data\n",
-                 (unsigned long long) bucket_mtime - mtime);
+            DEBUG("cache data is %llu seconds newer than the data caller wants\n",
+                 (unsigned long long) bucket_stat.st_mtime - mtime);
         }
         cache_invalidate_file_real(filename, true);
         errno = ENOENT;
@@ -810,8 +872,8 @@ void make_space_available(uint64_t bytes_needed)
  * Important: this must be the FULL block. All subsequent reads will
  * assume that the full block is here.
  */
-int cache_add(const char *filename, uint32_t block, const char *buf,
-              uint64_t len, time_t mtime)
+int cache_add(const char *filename, uint32_t block, const char *buf, uint64_t len,
+              const struct stat* stbuf)
 {
     if (len > bucket_max_size) {
         errno = EOVERFLOW;
@@ -899,15 +961,15 @@ int cache_add(const char *filename, uint32_t block, const char *buf,
     fsll_makelink(bucketpath, "parent", fullfilemap);
     FREE(fullfilemap);
     
-    // write mtime
+    // write stat
     
-    char mtimepath[PATH_MAX];
-    snprintf(mtimepath, PATH_MAX, "%s/map%s/mtime", cache_dir, filename);
-    FILE *f = fopen(mtimepath, "w");
+    char statpath[PATH_MAX];
+    snprintf(statpath, PATH_MAX, "%s/map%s/stat", cache_dir, filename);
+    FILE *f = fopen(statpath, "w");
     if (f == NULL) {
-        PERROR("opening mtime file in cache_add failed");
+        PERROR("opening stat file in cache_add failed");
     } else {
-        fprintf(f, "%llu\n", (unsigned long long) mtime);
+        fwrite(stbuf, sizeof(*stbuf), 1, f);
         fclose(f);
     }
 
@@ -1031,12 +1093,12 @@ int cache_has_file_real(const char *filename, uint64_t *cached_byte_count, bool 
         }
     }
 
-    // Check if it's a file or directory (see if it has an mtime file).
-    asprintf(&data, "%s/mtime", mapdir);
+    // Check if it's a file or directory (see if it has an stat file).
+    asprintf(&data, "%s/stat", mapdir);
     bool is_file = false;
-    struct stat mtime_stat = {0};
-    if (0 == stat(data, &mtime_stat)) {
-        is_file = (mtime_stat.st_mode & S_IFREG) != 0;
+    struct stat stat_stat = {0};
+    if (0 == stat(data, &stat_stat)) {
+        is_file = (stat_stat.st_mode & S_IFREG) != 0;
     }
     else if (errno != ENOENT) {
         PERROR("stat");
@@ -1048,7 +1110,7 @@ int cache_has_file_real(const char *filename, uint64_t *cached_byte_count, bool 
     // Loop over the sub-entries in the map.
     struct dirent *dirent = NULL;
     while ((dirent = readdir(dir)) != NULL) {
-        if (dirent->d_name[0] != '.' && strcmp(dirent->d_name, "mtime") != 0) {
+        if (dirent->d_name[0] != '.' && strcmp(dirent->d_name, "stat") != 0) {
             FREE(data);
 
             if (is_file) {
@@ -1136,7 +1198,7 @@ int cache_rename(const char *path, const char *path_new)
 
     struct dirent *dirent = NULL;
     while ((dirent = readdir(dir)) != NULL) {
-        if (dirent->d_name[0] != '.' && strcmp(dirent->d_name, "mtime") != 0) {
+        if (dirent->d_name[0] != '.' && strcmp(dirent->d_name, "stat") != 0) {
             snprintf(parentlink, cch_parentlink, "%s/%s/parent",
                 mapdir_new, dirent->d_name);
 

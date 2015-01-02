@@ -47,6 +47,7 @@ struct backfs {
     unsigned long long cache_size;
     unsigned long long block_size;
     bool rw;
+    bool offline;
     pthread_mutex_t lock;
 };
 static struct backfs backfs = {0};
@@ -93,8 +94,9 @@ void usage()
         "                           (default is for cache to grow to fill the device\n"
         "                              it is on)\n"
 #ifdef BACKFS_RW
-        "    -o rw                  be a read-write cache (default is read-only)\n"
+        "    -o rw                  be a read-write cache (default is read-only, conflict with offline)\n"
 #endif
+        "    -o offline             start off in offline mode (conflict with rw)\n"
         "    -o block_size          cache block size. defaults to 128K\n"
         "    -v --verbose           Enable informational messages.\n"
         "       -o verbose\n"
@@ -175,12 +177,21 @@ int backfs_access(const char *path, int mode)
     int ret = 0;
     char *real = NULL;
 
-    REALPATH(real, path);
     struct stat stbuf;
-    ret = lstat(real, &stbuf);
-    if (ret == -1) {
-        ret = -errno;
-        goto exit;
+    if (backfs.offline) {
+        ret = cache_stat(path, &stbuf);
+        if (ret == -1) {
+            ret = -errno;
+            goto exit;
+        }
+    }
+    else {
+        REALPATH(real, path);
+        ret = lstat(real, &stbuf);
+        if (ret == -1) {
+          ret = -errno;
+          goto exit;
+        }
     }
 
     DEBUG("checkmode: 0%o\n", checkmode);
@@ -233,6 +244,15 @@ int backfs_open(const char *path, struct fuse_file_info *fi)
         if ((fi->flags & 3) != O_RDONLY)
             ret = -EACCES;
         goto exit;
+    }
+
+    struct stat stbuf;
+    if (backfs.offline) {
+        ret = cache_stat(path, &stbuf);
+        if (ret) ret = -errno;
+        // TODO OFFLINE: Handle directory, read-write, creation, etc.
+        // Notes: fd is not open in offline mode !
+        return ret;
     }
 
     REALPATH(real, path);
@@ -320,13 +340,15 @@ int backfs_write(const char *path, const char *buf, size_t size, off_t offset,
         
         if (block_size == backfs.block_size) {
             // a full block, save it to the cache
+            struct stat stbuf = {0};
+            fstat((int)fi->fh, &stbuf);
             for (int loop = 0; loop < 5; loop++) {
                 if (0 == cache_add(
                             path,
                             block,
                             buf + buf_offset,
                             nwritten,
-                            time(NULL))
+                            &stbuf)
                         || errno != EAGAIN) {
                     break;
                 }
@@ -356,8 +378,12 @@ int backfs_readlink(const char *path, char *buf, size_t bufsize)
     int ret = 0;
     char *real = NULL;
 
-    REALPATH(real, path);
+    if (backfs.offline) {
+        // TODO OFFLINE: Links aren't supported for now.
+        return -ENOENT;
+    }
 
+    REALPATH(real, path);
     ssize_t bytes_written = readlink(real, buf, bufsize-1);
     if (bytes_written == -1)
     {
@@ -403,9 +429,15 @@ int backfs_getattr(const char *path, struct stat *stbuf)
         goto exit;
     }
 
-    REALPATH(real, path);
-    ret = lstat(real, stbuf);
-    
+    if (backfs.offline) {
+        memset(stbuf, 0, sizeof(struct stat));
+        ret = cache_stat(path, stbuf);
+    }
+    else {
+        REALPATH(real, path);
+        ret = lstat(real, stbuf);
+    }
+
     // no write perms
     if (!backfs.rw) {
         stbuf->st_mode &= ~0222;
@@ -495,15 +527,16 @@ int backfs_read(const char *path, char *rbuf, size_t size, off_t offset,
                 (unsigned long) block,
                 (unsigned long) block_offset,
                 (unsigned long) block_offset + block_size);
-                
-        REALPATH(real, path);
-        
+
         struct stat real_stat;
         real_stat.st_mtime = 0;
-        if (stat(real, &real_stat) == -1) {
-            PERROR("stat on real file failed");
-            ret = -1 * errno;
-            goto exit;
+        if (!backfs.offline) {
+          REALPATH(real, path);
+          if (stat(real, &real_stat) == -1) {
+              PERROR("stat on real file failed");
+              ret = -1 * errno;
+              goto exit;
+          }
         }
 
         uint64_t bread = 0;
@@ -511,7 +544,11 @@ int backfs_read(const char *path, char *rbuf, size_t size, off_t offset,
                 rbuf + buf_offset, block_size, &bread, real_stat.st_mtime);
         if (result == -1) {
             if (errno == ENOENT) {
-                // not an error
+                if (backfs.offline) {
+                  ret = -ENOENT;
+                  goto exit;
+                }
+                // else not an error
             } else {
                 PERROR("read from cache failed");
                 ret = -EIO;
@@ -544,7 +581,7 @@ int backfs_read(const char *path, char *rbuf, size_t size, off_t offset,
                                 block,
                                 block_buf,
                                 nread,
-                                real_stat.st_mtime)
+                                &real_stat)
                             || errno != EAGAIN) {
                         break;
                     }
@@ -605,7 +642,26 @@ int backfs_opendir(const char *path, struct fuse_file_info *fi)
     DEBUG("opendir %s\n", path);
     int ret = 0;
     char *real = NULL;
-    REALPATH(real, path);
+
+    if (backfs.offline) {
+        // TODO OFFLINE: Handle it in fscache instead.
+        // Must check if cache is really a directory (since cached files are directory too.)
+        if (-1 == asprintf(&real, "%s/map%s/stat", backfs.cache_dir, path)) {
+            ret = -ENOMEM;
+            goto exit;
+        }
+        struct stat stbuf;
+        // Getting an error is good here.
+        if (lstat(real, &stbuf) == 0) {
+            if (S_ISREG(stbuf.st_mode)) {
+                ret = -ENOTDIR;
+                goto exit;
+            }
+        }
+    } else {
+        REALPATH(real, path);
+    }
+
 
     DIR *dir = opendir(real);
 
@@ -657,7 +713,16 @@ int backfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         goto exit;
     }
 
-    REALPATH(real, path);
+    // TODO OFFLINE : Check that the online/offline stat is consistent with the dir handle.
+    if (backfs.offline) {
+        // TODO OFFLINE: Handle it in fscache instead.
+        if (-1 == asprintf(&real, "%s/map%s", backfs.cache_dir, path)) {
+            ret = -ENOMEM;
+            goto exit;
+        }
+    } else {
+        REALPATH(real, path);
+    }
 
     // fs control handle
     if (strcmp("/", path) == 0) {
@@ -1188,6 +1253,7 @@ static struct fuse_operations BackFS_Opers = {
 
 enum {
     KEY_RW,
+    KEY_OFFLINE,
     KEY_VERBOSE,
     KEY_DEBUG,
     KEY_HELP,
@@ -1200,6 +1266,7 @@ static struct fuse_opt backfs_opts[] = {
     {"backing_fs=%s",   offsetof(struct backfs, real_root),     0},
     {"block_size=%llu", offsetof(struct backfs, block_size),    0},
     FUSE_OPT_KEY("rw",          KEY_RW),
+    FUSE_OPT_KEY("offline",     KEY_OFFLINE),
     FUSE_OPT_KEY("verbose",     KEY_VERBOSE),
     FUSE_OPT_KEY("-v",          KEY_VERBOSE),
     FUSE_OPT_KEY("--verbose",   KEY_VERBOSE),
@@ -1249,6 +1316,10 @@ int backfs_opt_proc(void *data, const char *arg, int key,
         break;
 
     case KEY_RW:
+        if (backfs.offline) {
+            fprintf(stderr, "BackFS: rw mode conflict with offline mode\n");
+            return FUSE_OPT_ERROR;
+        }
 #ifdef BACKFS_RW
         // Print a nasty warning to stdout
         printf("####################################\n"
@@ -1264,6 +1335,14 @@ int backfs_opt_proc(void *data, const char *arg, int key,
         fprintf(stderr, "BackFS: mounting r/w is not supported in this build.\n");
         return FUSE_OPT_ERROR;
 #endif
+
+    case KEY_OFFLINE:
+        if (backfs.rw) {
+            fprintf(stderr, "BackFS: offline mode conflict with rw mode\n");
+            return FUSE_OPT_ERROR;
+        }
+        backfs.offline = true;
+        return FUSE_OPT_DISCARD;
 
     case KEY_VERBOSE:
         backfs_log_level = LOG_LEVEL_INFO;
@@ -1342,7 +1421,7 @@ int main(int argc, char **argv)
     }
 
     DIR *d;
-    if ((d = opendir(backfs.real_root)) == NULL) {
+    if (!backfs.offline && (d = opendir(backfs.real_root)) == NULL) {
         perror("BackFS ERROR: error checking backing filesystem");
         fprintf(stderr, "BackFS: specified as \"%s\"\n", backfs.real_root);
         return 2;
