@@ -37,41 +37,19 @@ extern bool backfs_log_stderr;
 
 static char *cache_dir;
 static uint64_t cache_size;
-static volatile uint64_t cache_used_size = 0;
-struct bucket_node { uint32_t number; struct bucket_node* next; };
-static struct bucket_node * volatile to_check;
+static uint64_t volatile cache_used_size = 0;
+static uint64_t * volatile to_check = NULL;
+static size_t volatile to_check_size = 0;
 static bool use_whole_device;
 static uint64_t bucket_max_size;
-
-uint64_t prepare_buckets_size_check(const char *root)
-{
-    INFO("taking inventory of cache directory\n");
-    uint64_t total = 0;
-    struct dirent *e = malloc(offsetof(struct dirent, d_name) + PATH_MAX + 1);
-    struct dirent *result = e;
-    DIR *dir = opendir(root);
-    struct bucket_node* volatile * next = &to_check;
-    while (readdir_r(dir, e, &result) == 0 && result != NULL) {
-        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-        *next = (struct bucket_node*)malloc(sizeof(struct bucket_node));
-        (*next)->number = atoi(e->d_name);
-        next = &((*next)->next);
-        *next = NULL;
-        ++total;
-    }
-    closedir(dir);
-    FREE(e);
-
-    return total;
-}
 
 /*
  * returns the bucket number corresponding to a bucket path
  * i.e. reads the number off the end.
  */
-uint32_t bucket_path_to_number(const char *bucketpath)
+uint64_t bucket_path_to_number(const char *bucketpath)
 {
-    uint32_t number = 0;
+    uint64_t number = 0;
     size_t s = strlen(bucketpath);
     size_t i;
     for (i = 1; i < s; i++) {
@@ -88,14 +66,39 @@ uint32_t bucket_path_to_number(const char *bucketpath)
     return number;
 }
 
+uint64_t prepare_buckets_size_check(const char *root)
+{
+    INFO("taking inventory of cache directory\n");
+    uint64_t total = 0;
+    struct dirent *e = malloc(offsetof(struct dirent, d_name) + PATH_MAX + 1);
+    struct dirent *result = e;
+    DIR *dir = opendir(root);
+    size_t capacity = 0;
+    while (readdir_r(dir, e, &result) == 0 && result != NULL) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        ++total;
+        if (total > capacity) {
+            capacity = total*2;
+            to_check = (uint64_t*)realloc(to_check,
+                                          capacity * sizeof(to_check[0]));
+        }
+        to_check[total-1] = bucket_path_to_number(e->d_name);
+    }
+    closedir(dir);
+    FREE(e);
+
+    to_check_size = total;
+    return total;
+}
+
 bool is_unchecked(const char* path)
 {
-    uint32_t number = bucket_path_to_number(path);
-    struct bucket_node* node = to_check;
-    while(node) {
-        if (node->number == number)
+    // Must be protected by a lock;
+    const size_t max_size = to_check_size;
+    const uint64_t number = bucket_path_to_number(path);
+    for(size_t i = 0; i < max_size; ++i) {
+        if (to_check[i] == number)
             return true;
-        node = node->next;
     }
     return false;
 }
@@ -104,35 +107,42 @@ void* check_buckets_size(void* arg)
 {
     INFO("starting cache size check\n");
     struct stat s;
-    struct bucket_node* bucket;
     if (arg != NULL) {
         abort();
     }
 
+    uint64_t max_size = to_check_size * bucket_max_size;
+    uint64_t actual_size = max_size;
+
     char buf[PATH_MAX];
 
-    while (to_check) {
+    while (to_check_size > 0) {
+        const uint64_t bucket = to_check[to_check_size - 1];
+        s.st_size = 0;
+        snprintf(buf, PATH_MAX, "%s/buckets/%u/data", cache_dir, bucket);
         pthread_mutex_lock(&lock);
-        bucket = to_check;
-        if (bucket) {
-            s.st_size = 0;
-            snprintf(buf, PATH_MAX, "%s/buckets/%u/data", cache_dir, bucket->number);
-            if (stat(buf, &s) == -1 && errno != ENOENT) {
-                PERROR("stat in get_cache_used_size");
-                ERROR("\tcaused by stat(%s)\n", buf);
-                pthread_mutex_unlock(&lock);
-                abort();
-            }
-            DEBUG("bucket %u: %llu bytes\n",
-                    bucket->number, (unsigned long long) s.st_size);
-            cache_used_size -= bucket_max_size - s.st_size;
-            to_check = bucket->next;
+        if (stat(buf, &s) == -1 && errno != ENOENT) {
+            PERROR("stat in get_cache_used_size");
+            ERROR("\tcaused by stat(%s)\n", buf);
+            pthread_mutex_unlock(&lock);
+            abort();
         }
+        DEBUG("bucket %u: %llu bytes\n",
+                bucket, (unsigned long long) s.st_size);
+        if (s.st_size == 0) {
+          max_size -= bucket_max_size;
+        }
+        actual_size -= bucket_max_size - s.st_size;
+        cache_used_size -= bucket_max_size - s.st_size;
+        --to_check_size;
         pthread_mutex_unlock(&lock);
-        free(bucket);
     }
-   INFO("finished cache size check: %llu bytes used\n",
+    free(to_check);
+    to_check = NULL;
+    INFO("finished cache size check: %llu bytes used\n",
            cache_used_size);
+    INFO("finished cache size usage: %.1f\n",
+         ((double)actual_size)/max_size);
     return NULL;
 }
 
